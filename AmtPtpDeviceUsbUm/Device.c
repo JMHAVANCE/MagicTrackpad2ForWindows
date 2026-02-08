@@ -302,7 +302,7 @@ AmtPtpGetWellspringMode(
 	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
 		&memoryDescriptor,
 		buffer,
-		sizeof(DeviceContext->DeviceInfo->um_size)
+		DeviceContext->DeviceInfo->um_size
 	);
 
 	WDF_USB_CONTROL_SETUP_PACKET_INIT(
@@ -351,7 +351,9 @@ cleanup:
 		"%!FUNC! Exit"
 	);
 
-	WdfObjectDelete(bufHandle);
+	if (bufHandle != NULL) {
+		WdfObjectDelete(bufHandle);
+	}
 	return status;
 
 }
@@ -487,7 +489,7 @@ AmtPtpSetWellspringMode(
 	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
 		&memoryDescriptor, 
 		buffer, 
-		sizeof(DeviceContext->DeviceInfo->um_size)
+		DeviceContext->DeviceInfo->um_size
 	);
 
 	WDF_USB_CONTROL_SETUP_PACKET_INIT(
@@ -572,7 +574,9 @@ cleanup:
 		"%!FUNC! Exit"
 	);
 
-	WdfObjectDelete(bufHandle);
+	if (bufHandle != NULL) {
+		WdfObjectDelete(bufHandle);
+	}
 	return status;
 
 }
@@ -706,7 +710,9 @@ cleanup:
 		"%!FUNC! Exit"
 	);
 
-	WdfObjectDelete(bufHandle);
+	if (bufHandle != NULL) {
+		WdfObjectDelete(bufHandle);
+	}
 	return status;
 }
 

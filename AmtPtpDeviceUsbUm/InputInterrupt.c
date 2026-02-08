@@ -104,8 +104,25 @@ AmtPtpEvtUsbInterruptPipeReadComplete(
 	device = WdfObjectContextGetObject(pDeviceContext);
 	size_t headerSize = (unsigned int) pDeviceContext->DeviceInfo->tp_header;
 	size_t fingerprintSize = (unsigned int) pDeviceContext->DeviceInfo->tp_fsize;
+	BOOLEAN malformedInput = FALSE;
 
-	if (NumBytesTransferred < headerSize || (NumBytesTransferred - headerSize) % fingerprintSize != 0) {
+	if (pDeviceContext->DeviceInfo->tp_type == TYPE5) {
+		size_t type5BareHeader = sizeof(struct TRACKPAD_REPORT_TYPE5);
+		size_t type5CombinedHeader = sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5);
+		size_t type5FingerSize = sizeof(struct TRACKPAD_FINGER_TYPE5);
+		BOOLEAN looksBare = NumBytesTransferred >= type5BareHeader &&
+			((NumBytesTransferred - type5BareHeader) % type5FingerSize == 0);
+		BOOLEAN looksCombined = NumBytesTransferred >= type5CombinedHeader &&
+			((NumBytesTransferred - type5CombinedHeader) % type5FingerSize == 0);
+
+		malformedInput = !(looksBare || looksCombined);
+	}
+	else {
+		malformedInput = NumBytesTransferred < headerSize ||
+			(NumBytesTransferred - headerSize) % fingerprintSize != 0;
+	}
+
+	if (malformedInput) {
 
 		TraceEvents(
 			TRACE_LEVEL_INFORMATION,
@@ -418,10 +435,11 @@ AmtPtpServiceTouchInputInterruptType5(
 	WDFREQUEST Request;
 	WDFMEMORY  RequestMemory;
 	PTP_REPORT PtpReport;
+	BOOLEAN	   requestRetrieved;
+	BOOLEAN	   requestCompleted;
 
 	const struct TRACKPAD_FINGER_TYPE5* f;
 	const struct TRACKPAD_REPORT_TYPE5* mt_report;
-	const struct TRACKPAD_COMBINED_REPORT_TYPE5* full_report;
 
 	TraceEvents(
 		TRACE_LEVEL_INFORMATION, 
@@ -430,12 +448,16 @@ AmtPtpServiceTouchInputInterruptType5(
 	);
 
 	Status = STATUS_SUCCESS;
+	requestRetrieved = FALSE;
+	requestCompleted = FALSE;
+	RtlZeroMemory(&PtpReport, sizeof(PtpReport));
 	PtpReport.ReportID = REPORTID_MULTITOUCH;
 	PtpReport.IsButtonClicked = 0;
 
 	UINT timestamp;
 	INT x, y = 0;
 	size_t raw_n, i = 0;
+	size_t mtReportOffset, mtReportBytes, mtPayloadBytes;
 
 	Status = WdfIoQueueRetrieveNextRequest(
 		DeviceContext->InputQueue,
@@ -450,6 +472,7 @@ AmtPtpServiceTouchInputInterruptType5(
 		);
 		goto exit;
 	}
+	requestRetrieved = TRUE;
 
 	Status = WdfRequestRetrieveOutputMemory(
 		Request, 
@@ -465,8 +488,73 @@ AmtPtpServiceTouchInputInterruptType5(
 		goto exit;
 	}
 
-	full_report = (const struct TRACKPAD_COMBINED_REPORT_TYPE5 *) Buffer;
-	mt_report = &full_report->MTReport;
+	mtReportOffset = 0;
+
+	if (
+		NumBytesTransferred >= sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5) &&
+		Buffer[0] == REPORTID_STANDARDMOUSE &&
+		Buffer[sizeof(struct MOUSE_REPORT)] == REPORTID_MULTITOUCH &&
+		(NumBytesTransferred - sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5)) % sizeof(struct TRACKPAD_FINGER_TYPE5) == 0
+	) {
+		mtReportOffset = sizeof(struct MOUSE_REPORT);
+	}
+	else if (
+		NumBytesTransferred >= sizeof(struct TRACKPAD_REPORT_TYPE5) &&
+		Buffer[0] == REPORTID_MULTITOUCH &&
+		(NumBytesTransferred - sizeof(struct TRACKPAD_REPORT_TYPE5)) % sizeof(struct TRACKPAD_FINGER_TYPE5) == 0
+	) {
+		mtReportOffset = 0;
+	}
+	else if (
+		NumBytesTransferred >= sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5) &&
+		(NumBytesTransferred - sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5)) % sizeof(struct TRACKPAD_FINGER_TYPE5) == 0
+	) {
+		mtReportOffset = sizeof(struct MOUSE_REPORT);
+	}
+	else if (
+		NumBytesTransferred >= sizeof(struct TRACKPAD_REPORT_TYPE5) &&
+		(NumBytesTransferred - sizeof(struct TRACKPAD_REPORT_TYPE5)) % sizeof(struct TRACKPAD_FINGER_TYPE5) == 0
+	) {
+		mtReportOffset = 0;
+	}
+	else {
+		Status = STATUS_DATA_ERROR;
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DRIVER,
+			"%!FUNC! Type5 report shape invalid (bytes=%llu)",
+			NumBytesTransferred
+		);
+		goto exit;
+	}
+
+	mtReportBytes = NumBytesTransferred - mtReportOffset;
+	if (mtReportBytes < sizeof(struct TRACKPAD_REPORT_TYPE5)) {
+		Status = STATUS_DATA_ERROR;
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DRIVER,
+			"%!FUNC! Type5 report too short after offset (bytes=%llu, offset=%llu)",
+			mtReportBytes,
+			mtReportOffset
+		);
+		goto exit;
+	}
+
+	mtPayloadBytes = mtReportBytes - sizeof(struct TRACKPAD_REPORT_TYPE5);
+	if (mtPayloadBytes % sizeof(struct TRACKPAD_FINGER_TYPE5) != 0) {
+		Status = STATUS_DATA_ERROR;
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DRIVER,
+			"%!FUNC! Type5 finger payload misaligned (payload=%llu)",
+			mtPayloadBytes
+		);
+		goto exit;
+	}
+
+	mt_report = (const struct TRACKPAD_REPORT_TYPE5*) (Buffer + mtReportOffset);
+	raw_n = mtPayloadBytes / sizeof(struct TRACKPAD_FINGER_TYPE5);
 
 	timestamp = (mt_report->TimestampHigh << 5) | mt_report->TimestampLow;
 	PtpReport.ScanTime = (USHORT) timestamp * 10;
@@ -490,7 +578,6 @@ AmtPtpServiceTouchInputInterruptType5(
 
 	// Type 5 finger report
 	if (DeviceContext->IsSurfaceReportOn) {
-		raw_n = (NumBytesTransferred - sizeof(struct TRACKPAD_REPORT_TYPE5)) / sizeof(struct TRACKPAD_FINGER_TYPE5);
 		if (raw_n >= PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
 		PtpReport.ContactCount = (UCHAR)raw_n;
 
@@ -532,6 +619,7 @@ AmtPtpServiceTouchInputInterruptType5(
 			// 6 = palm on MT2, 7 = palm on my MBP9,2 (why are these different?)
 			// BOOL valid_finger = f->Finger != 6;
 			PtpReport.Contacts[i].Confidence = DeviceContext->PalmRejection == FALSE ? TRUE : f->Finger != 6; // valid_size && valid_finger;
+			PtpReport.Contacts[i].Padding = (f->Pressure >> 2) & 0x3F;
 
 #define UINT32_SET_MSB(v) ((UINT32)v | ((UINT32)1 << 31))
 
@@ -641,8 +729,16 @@ AmtPtpServiceTouchInputInterruptType5(
 		Request, 
 		Status
 	);
+	requestCompleted = TRUE;
 
 exit:
+	if (requestRetrieved && !requestCompleted) {
+		WdfRequestComplete(
+			Request,
+			Status
+		);
+	}
+
 	TraceEvents(
 		TRACE_LEVEL_INFORMATION, 
 		TRACE_DRIVER, 
