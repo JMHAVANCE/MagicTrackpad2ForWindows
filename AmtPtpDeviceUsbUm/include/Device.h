@@ -13,6 +13,7 @@ typedef struct _DEVICE_CONTEXT
 {
 	WDFUSBDEVICE                UsbDevice;
 	WDFUSBPIPE                  InterruptPipe;
+	WDFUSBPIPE                  HapticOutPipe;
 	WDFUSBINTERFACE             UsbInterface;
 	WDFQUEUE                    InputQueue;
 
@@ -29,6 +30,7 @@ typedef struct _DEVICE_CONTEXT
 	BOOL                        IsWellspringModeOn;
 	BOOL                        IsSurfaceReportOn;
 	BOOL                        IsButtonReportOn;
+	BOOL                        IsHostClickEnabled;
 
 	LARGE_INTEGER				PerfCounter;
 
@@ -72,6 +74,8 @@ AmtPtpCreateDevice(
 EVT_WDF_DEVICE_PREPARE_HARDWARE AmtPtpEvtDevicePrepareHardware;
 EVT_WDF_DEVICE_D0_ENTRY AmtPtpEvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT AmtPtpEvtDeviceD0Exit;
+EVT_WDF_DEVICE_FILE_CREATE AmtPtpEvtDeviceFileCreate;
+EVT_WDF_FILE_CLOSE AmtPtpEvtFileClose;
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
@@ -102,6 +106,14 @@ AmtPtpSetWellspringMode(
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 AmtPtpSetHapticFeedback(
+	_In_ PDEVICE_CONTEXT DeviceContext,
+	_In_ ULONG FeedbackClick,
+	_In_ ULONG FeedbackRelease
+);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+AmtPtpEmitHapticPulse(
 	_In_ PDEVICE_CONTEXT DeviceContext,
 	_In_ ULONG FeedbackClick,
 	_In_ ULONG FeedbackRelease

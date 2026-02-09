@@ -31,6 +31,8 @@ AmtPtpCreateDevice(
 	WDF_PNPPOWER_EVENT_CALLBACKS		pnpPowerCallbacks;
 	WDF_DEVICE_PNP_CAPABILITIES         pnpCaps;
 	WDF_OBJECT_ATTRIBUTES				deviceAttributes;
+	WDF_FILEOBJECT_CONFIG				fileConfig;
+	WDF_OBJECT_ATTRIBUTES				fileAttributes;
 	PDEVICE_CONTEXT						deviceContext;
 	WDFDEVICE							device;
 	NTSTATUS							status;
@@ -52,6 +54,19 @@ AmtPtpCreateDevice(
 	pnpPowerCallbacks.EvtDeviceD0Entry = AmtPtpEvtDeviceD0Entry;
 	pnpPowerCallbacks.EvtDeviceD0Exit = AmtPtpEvtDeviceD0Exit;
 	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
+
+	WDF_FILEOBJECT_CONFIG_INIT(
+		&fileConfig,
+		AmtPtpEvtDeviceFileCreate,
+		AmtPtpEvtFileClose,
+		WDF_NO_EVENT_CALLBACK
+	);
+	WDF_OBJECT_ATTRIBUTES_INIT(&fileAttributes);
+	WdfDeviceInitSetFileObjectConfig(
+		DeviceInit,
+		&fileConfig,
+		&fileAttributes
+	);
 
 	// Create WDF device object
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
@@ -115,6 +130,26 @@ AmtPtpCreateDevice(
 	);
 
 	return status;
+}
+
+VOID
+AmtPtpEvtDeviceFileCreate(
+	_In_ WDFDEVICE Device,
+	_In_ WDFREQUEST Request,
+	_In_ WDFFILEOBJECT FileObject
+)
+{
+	UNREFERENCED_PARAMETER(Device);
+	UNREFERENCED_PARAMETER(FileObject);
+	WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+VOID
+AmtPtpEvtFileClose(
+	_In_ WDFFILEOBJECT FileObject
+)
+{
+	UNREFERENCED_PARAMETER(FileObject);
 }
 
 NTSTATUS
@@ -716,6 +751,144 @@ cleanup:
 	return status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+AmtPtpEnableHostClickIfNeeded(
+	_In_ PDEVICE_CONTEXT DeviceContext
+)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	UCHAR feature[] = { 0x21, 0x01 };
+	WDF_MEMORY_DESCRIPTOR memoryDescriptor;
+	WDF_USB_CONTROL_SETUP_PACKET setupPacket;
+	ULONG cbTransferred = 0;
+
+	if (DeviceContext->IsHostClickEnabled) {
+		return STATUS_SUCCESS;
+	}
+
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+		&memoryDescriptor,
+		feature,
+		sizeof(feature)
+	);
+
+	WDF_USB_CONTROL_SETUP_PACKET_INIT(
+		&setupPacket,
+		BmRequestHostToDevice,
+		BmRequestToInterface,
+		9,
+		0x0321,
+		2
+	);
+	setupPacket.Packet.bm.Request.Type = BmRequestClass;
+
+	status = WdfUsbTargetDeviceSendControlTransferSynchronously(
+		DeviceContext->UsbDevice,
+		WDF_NO_HANDLE,
+		NULL,
+		&setupPacket,
+		&memoryDescriptor,
+		&cbTransferred
+	);
+
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DEVICE,
+			"%!FUNC! Failed to enable host click mode %!STATUS!",
+			status
+		);
+		return status;
+	}
+
+	DeviceContext->IsHostClickEnabled = TRUE;
+	return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+AmtPtpEmitHapticPulse(
+	_In_ PDEVICE_CONTEXT DeviceContext,
+	_In_ ULONG FeedbackClick,
+	_In_ ULONG FeedbackRelease
+)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	BYTE vibDown[] = { 0x53, 0x01, 0x17, 0x78, 0x02, 0x06, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12 };
+	BYTE vibUp[] = { 0x53, 0x01, 0x14, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
+	WDF_MEMORY_DESCRIPTOR memoryDescriptor;
+
+	status = AmtPtpEnableHostClickIfNeeded(DeviceContext);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	vibDown[3] = (BYTE)(FeedbackClick >> 16);
+	vibDown[6] = (BYTE)(FeedbackClick >> 8);
+	vibDown[11] = (BYTE)(FeedbackClick >> 0);
+
+	vibUp[3] = (BYTE)(FeedbackRelease >> 16);
+	vibUp[6] = (BYTE)(FeedbackRelease >> 8);
+	vibUp[11] = (BYTE)(FeedbackRelease >> 0);
+
+	if (DeviceContext->HapticOutPipe == NULL) {
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DEVICE,
+			"%!FUNC! Haptic out pipe missing; fallback to control transfer path"
+		);
+		return AmtPtpSetHapticFeedback(DeviceContext, FeedbackClick, FeedbackRelease);
+	}
+
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+		&memoryDescriptor,
+		vibDown,
+		sizeof(vibDown)
+	);
+	status = WdfUsbTargetPipeWriteSynchronously(
+		DeviceContext->HapticOutPipe,
+		WDF_NO_HANDLE,
+		NULL,
+		&memoryDescriptor,
+		NULL
+	);
+
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DEVICE,
+			"%!FUNC! vibDown write failed with %!STATUS!",
+			status
+		);
+		return status;
+	}
+
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+		&memoryDescriptor,
+		vibUp,
+		sizeof(vibUp)
+	);
+	status = WdfUsbTargetPipeWriteSynchronously(
+		DeviceContext->HapticOutPipe,
+		WDF_NO_HANDLE,
+		NULL,
+		&memoryDescriptor,
+		NULL
+	);
+
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DEVICE,
+			"%!FUNC! vibUp write failed with %!STATUS!",
+			status
+		);
+	}
+
+	return status;
+}
+
 NTSTATUS
 AmtPtpEvtDeviceD0Entry(
 	_In_ WDFDEVICE Device,
@@ -728,6 +901,7 @@ AmtPtpEvtDeviceD0Entry(
 
 	pDeviceContext = DeviceGetContext(Device);
 	isTargetStarted = FALSE;
+	pDeviceContext->IsHostClickEnabled = FALSE;
 
 	TraceEvents(
 		TRACE_LEVEL_INFORMATION, 
@@ -825,6 +999,7 @@ AmtPtpEvtDeviceD0Exit(
 	);
 
 	pDeviceContext = DeviceGetContext(Device);
+	pDeviceContext->IsHostClickEnabled = FALSE;
 
 	// Stop IO Pipe.
 	WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(
@@ -868,65 +1043,70 @@ SelectInterruptInterface(
 	_In_ WDFDEVICE Device
 )
 {
-	WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
 	NTSTATUS                            status = STATUS_SUCCESS;
 	PDEVICE_CONTEXT                     pDeviceContext;
 	WDFUSBPIPE                          pipe;
 	WDF_USB_PIPE_INFORMATION            pipeInfo;
+	WDFUSBINTERFACE                     usbInterface;
+	UCHAR                               interfaceIndex;
 	UCHAR                               index;
 	UCHAR                               numberConfiguredPipes;
-	WDFUSBINTERFACE                     usbInterface;
+	UCHAR                               numberInterfaces;
 
 	PAGED_CODE();
 
 	pDeviceContext = DeviceGetContext(Device);
-	WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
-	usbInterface = WdfUsbTargetDeviceGetInterface(
-		pDeviceContext->UsbDevice,
-		0
-	);
-
-	if (NULL == usbInterface) {
+	numberInterfaces = WdfUsbTargetDeviceGetNumInterfaces(pDeviceContext->UsbDevice);
+	if (numberInterfaces == 0) {
 		status = STATUS_UNSUCCESSFUL;
 		TraceEvents(
 			TRACE_LEVEL_ERROR, 
 			TRACE_DEVICE,
-			"%!FUNC! WdfUsbTargetDeviceGetInterface 0 failed %!STATUS!",
+			"%!FUNC! WdfUsbTargetDeviceGetNumInterfaces returned 0 %!STATUS!",
 			status
 		);
 		return status;
 	}
+	pDeviceContext->InterruptPipe = NULL;
+	pDeviceContext->HapticOutPipe = NULL;
+	pDeviceContext->IsHostClickEnabled = FALSE;
 
-	configParams.Types.SingleInterface.ConfiguredUsbInterface = usbInterface;
-	configParams.Types.SingleInterface.NumberConfiguredPipes = WdfUsbInterfaceGetNumConfiguredPipes(usbInterface);
-
-	pDeviceContext->UsbInterface = configParams.Types.SingleInterface.ConfiguredUsbInterface;
-	numberConfiguredPipes = configParams.Types.SingleInterface.NumberConfiguredPipes;
-
-	//
-	// Get pipe handles
-	//
-	for (index = 0; index < numberConfiguredPipes; index++) {
-
-		WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
-
-		pipe = WdfUsbInterfaceGetConfiguredPipe(
-			pDeviceContext->UsbInterface,
-			index, //PipeIndex,
-			&pipeInfo
+	for (interfaceIndex = 0; interfaceIndex < numberInterfaces; interfaceIndex++) {
+		usbInterface = WdfUsbTargetDeviceGetInterface(
+			pDeviceContext->UsbDevice,
+			interfaceIndex
 		);
 
-		//
-		// Tell the framework that it's okay to read less than
-		// MaximumPacketSize
-		//
-		WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
-
-		if (WdfUsbPipeTypeInterrupt == pipeInfo.PipeType) {
-			pDeviceContext->InterruptPipe = pipe;
-			break;
+		if (NULL == usbInterface) {
+			continue;
 		}
 
+		if (interfaceIndex == 0) {
+			pDeviceContext->UsbInterface = usbInterface;
+		}
+
+		numberConfiguredPipes = WdfUsbInterfaceGetNumConfiguredPipes(usbInterface);
+		for (index = 0; index < numberConfiguredPipes; index++) {
+			WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+			pipe = WdfUsbInterfaceGetConfiguredPipe(
+				usbInterface,
+				index,
+				&pipeInfo
+			);
+
+			WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
+
+			if (WdfUsbPipeTypeInterrupt == pipeInfo.PipeType) {
+				if (WdfUsbTargetPipeIsInEndpoint(pipe) && pDeviceContext->InterruptPipe == NULL) {
+					pDeviceContext->InterruptPipe = pipe;
+					continue;
+				}
+
+				if (WdfUsbTargetPipeIsOutEndpoint(pipe) && pDeviceContext->HapticOutPipe == NULL) {
+					pDeviceContext->HapticOutPipe = pipe;
+				}
+			}
+		}
 	}
 
 	//
@@ -942,6 +1122,14 @@ SelectInterruptInterface(
 		);
 
 		return status;
+	}
+
+	if (!pDeviceContext->HapticOutPipe) {
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_DEVICE,
+			"%!FUNC! No interrupt out pipe found; host click pulse may be unavailable"
+		);
 	}
 
 	return status;

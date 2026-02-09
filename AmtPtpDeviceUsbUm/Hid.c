@@ -4,6 +4,37 @@
 #include <StaticHidRegistry.h>
 #include "Hid.tmh"
 
+#define AMTPTP_HAPTIC_MAGIC0 0xA5
+#define AMTPTP_HAPTIC_MAGIC1 0x5A
+#define AMTPTP_HAPTIC_STRENGTH_WEAK 0x00
+#define AMTPTP_HAPTIC_STRENGTH_MEDIUM 0x01
+#define AMTPTP_HAPTIC_STRENGTH_STRONG 0x02
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static void
+AmtPtpResolveTapHapticFeedback(
+	_In_ UCHAR strengthCode,
+	_Out_ PULONG feedbackClick,
+	_Out_ PULONG feedbackRelease
+)
+{
+	switch (strengthCode) {
+	case AMTPTP_HAPTIC_STRENGTH_WEAK:
+		*feedbackClick = 0x040415;
+		*feedbackRelease = 0x000010;
+		break;
+	case AMTPTP_HAPTIC_STRENGTH_STRONG:
+		*feedbackClick = 0x08081E;
+		*feedbackRelease = 0x020218;
+		break;
+	case AMTPTP_HAPTIC_STRENGTH_MEDIUM:
+	default:
+		*feedbackClick = 0x060617;
+		*feedbackRelease = 0x000014;
+		break;
+	}
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 AmtPtpGetHidDescriptor(
@@ -1081,6 +1112,46 @@ AmtPtpSetFeatures(
 				"%!FUNC! Report REPORTID_UMAPP_CONF is requested"
 			);
 			PPTP_USERMODEAPP_CONF_REPORT umConfInput = (PPTP_USERMODEAPP_CONF_REPORT) packet.reportBuffer;
+
+			if (umConfInput->PressureQualificationLevel == AMTPTP_HAPTIC_MAGIC0 &&
+				umConfInput->SingleContactSizeQualificationLevel == AMTPTP_HAPTIC_MAGIC1) {
+				ULONG feedbackClick = 0;
+				ULONG feedbackRelease = 0;
+				AmtPtpResolveTapHapticFeedback(
+					umConfInput->MultipleContactSizeQualificationLevel,
+					&feedbackClick,
+					&feedbackRelease
+				);
+
+				status = AmtPtpEmitHapticPulse(
+					deviceContext,
+					feedbackClick,
+					feedbackRelease
+				);
+
+				if (!NT_SUCCESS(status)) {
+					TraceEvents(
+						TRACE_LEVEL_ERROR,
+						TRACE_DRIVER,
+						"%!FUNC! -> AmtPtpEmitHapticPulse failed with status %!STATUS!",
+						status
+					);
+					goto exit;
+				}
+
+				WdfRequestSetInformation(
+					Request,
+					sizeof(PTP_USERMODEAPP_CONF_REPORT)
+				);
+
+				TraceEvents(
+					TRACE_LEVEL_INFORMATION,
+					TRACE_DRIVER,
+					"%!FUNC! Report REPORTID_UMAPP_CONF haptic pulse fulfilled strength=%d",
+					umConfInput->MultipleContactSizeQualificationLevel
+				);
+				break;
+			}
 
 			// Set value
 			deviceContext->SgContactSizeQualLevel = umConfInput->SingleContactSizeQualificationLevel;

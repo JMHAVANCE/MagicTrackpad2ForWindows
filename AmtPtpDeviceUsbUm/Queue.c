@@ -1,7 +1,64 @@
-// Queue.c: This file contains the queue entry points and callbacks.
+ï»¿// Queue.c: This file contains the queue entry points and callbacks.
 
 #include <driver.h>
 #include "queue.tmh"
+
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS
+AmtPtpHandleHapticPulseIoctl(
+	_In_ WDFDEVICE Device,
+	_In_ WDFREQUEST Request,
+	_In_ size_t InputBufferLength
+)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+	ULONG feedbackClick = ReadSettingValue(L"FeedbackClick", 0x08081E);
+	ULONG feedbackRelease = ReadSettingValue(L"FeedbackRelease", 0x020218);
+
+	if (InputBufferLength >= sizeof(AMTPTP_HAPTIC_PULSE_REQUEST)) {
+		PAMTPTP_HAPTIC_PULSE_REQUEST pulseRequest = NULL;
+
+		status = WdfRequestRetrieveInputBuffer(
+			Request,
+			sizeof(AMTPTP_HAPTIC_PULSE_REQUEST),
+			(PVOID*) &pulseRequest,
+			NULL
+		);
+
+		if (!NT_SUCCESS(status)) {
+			TraceEvents(
+				TRACE_LEVEL_ERROR,
+				TRACE_QUEUE,
+				"%!FUNC! WdfRequestRetrieveInputBuffer failed with %!STATUS!",
+				status
+			);
+			return status;
+		}
+
+		if (pulseRequest->FeedbackClick != 0) {
+			feedbackClick = pulseRequest->FeedbackClick;
+		}
+
+		if (pulseRequest->FeedbackRelease != 0) {
+			feedbackRelease = pulseRequest->FeedbackRelease;
+		}
+	}
+
+	status = AmtPtpEmitHapticPulse(deviceContext, feedbackClick, feedbackRelease);
+	if (!NT_SUCCESS(status)) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_QUEUE,
+			"%!FUNC! AmtPtpEmitHapticPulse failed with %!STATUS!",
+			status
+		);
+		return status;
+	}
+
+	WdfRequestSetInformation(Request, 0);
+	return STATUS_SUCCESS;
+}
 
 NTSTATUS
 AmtPtpDeviceQueueInitialize(
@@ -109,6 +166,8 @@ DbgIoControlGetString(
 		return "IOCTL_HID_DEACTIVATE_DEVICE";
 	case IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST:
 		return "IOCTL_HID_SEND_IDLE_NOTIFICATION_REQUEST";
+	case IOCTL_AMTPTP_HAPTIC_PULSE:
+		return "IOCTL_AMTPTP_HAPTIC_PULSE";
 	default:
 		return "IOCTL_UNKNOWN";
 	}
@@ -185,6 +244,13 @@ AmtPtpDeviceEvtIoDeviceControl(
 				Request
 			);
 			break;
+		case IOCTL_AMTPTP_HAPTIC_PULSE:
+			status = AmtPtpHandleHapticPulseIoctl(
+				device,
+				Request,
+				InputBufferLength
+			);
+			break;
 		case IOCTL_HID_WRITE_REPORT:
 		case IOCTL_UMDF_HID_SET_OUTPUT_REPORT:
 		case IOCTL_UMDF_HID_GET_INPUT_REPORT:
@@ -250,7 +316,7 @@ AmtPtpDeviceEvtIoStop(
 	//
 	// A driver might choose to take no action in EvtIoStop for requests that are
 	// guaranteed to complete in a small amount of time. For example, the driver might
-	// take no action for requests that are completed in one of the driver’s request handlers.
+	// take no action for requests that are completed in one of the driver's request handlers.
 	//
 
 	return;

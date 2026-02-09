@@ -2,6 +2,15 @@
 
 EXTERN_C_START
 
+#define AMTPTP_IOCTL_INDEX_HAPTIC_PULSE 0x801
+#define IOCTL_AMTPTP_HAPTIC_PULSE CTL_CODE(FILE_DEVICE_UNKNOWN, AMTPTP_IOCTL_INDEX_HAPTIC_PULSE, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _AMTPTP_HAPTIC_PULSE_REQUEST
+{
+	ULONG FeedbackClick;
+	ULONG FeedbackRelease;
+} AMTPTP_HAPTIC_PULSE_REQUEST, *PAMTPTP_HAPTIC_PULSE_REQUEST;
+
 //
 // This is the context that can be placed per queue
 // and would contain per queue information.
